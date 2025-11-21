@@ -120,24 +120,55 @@ class BattModel:
         return p_loss_values
        
     def plot_efficiency_map(self, power_vec_operation=None, soc_vec_operation=None):
-        eff_map = []
-        for curr_soc in range(101):
-            p_values, eta_values, V_values = self.get_efficiency_curve(max_load_power=self.U_max*self.capacity_C/3600,soc=curr_soc)
-            eff_map.append(eta_values)
-        #X, Y = np.meshgrid(x, y)
-        #print(eff_map)
-        fig = plt.figure(figsize=(10, 6))
-        cax = plt.matshow(np.array(eff_map), fignum=0, aspect='auto', origin='lower', 
-                          extent=[0, self.U_max*self.capacity_C/3600, 0, 100])
-        plt.colorbar(cax, label="Efficiency [0-1]")
-        plt.title("Battery Efficiency Map")
-        plt.xlabel("Power [W]")
-        plt.ylabel("SOC [%]")
+        soc_range = range(101)
+        
+        # Determine power range
+        if power_vec_operation is not None and len(power_vec_operation) > 0:
+            min_p_op = min(power_vec_operation)
+            max_p_op = max(power_vec_operation)
+            margin = (max_p_op - min_p_op) * 0.1 if max_p_op != min_p_op else 100
+            min_p = min_p_op - margin
+            max_p = max_p_op + margin
+        else:
+            max_theoretical = self.U_max * self.capacity_C / 3600
+            min_p = -max_theoretical
+            max_p = max_theoretical
+        
+        # Create grid for contour plot
+        p_grid = np.linspace(min_p, max_p, 200)
+        soc_grid = np.array(soc_range)
+        P, S = np.meshgrid(p_grid, soc_grid)
+        
+        # Calculate efficiency for the grid
+        Z = np.zeros_like(P)
+        for i, soc in enumerate(soc_grid):
+            for j, p in enumerate(p_grid):
+                Z[i, j] = self.get_efficiency(power=p, soc=soc)
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        # Heatmap
+        cax = ax.imshow(Z, aspect='auto', origin='lower', 
+                           extent=[min_p, max_p, 0, 100], cmap='viridis')
+        fig.colorbar(cax, label="Efficiency [0-1]")
+        
+        # Contour lines
+        contours = ax.contour(P, S, Z, levels=10, colors='white', alpha=0.5)
+        ax.clabel(contours, inline=True, fontsize=8, fmt='%.2f')
+
+        # Operating points
+        if power_vec_operation is not None and soc_vec_operation is not None:
+            ax.scatter(power_vec_operation, soc_vec_operation, c='red', s=10, alpha=0.5, label="Operating Points")
+            ax.legend()
+
+        ax.set_title("Battery Efficiency Map")
+        ax.set_xlabel("Power [W] (Negative = Charging)")
+        ax.set_ylabel("SOC [%]")
         return fig
 
 
 class LVDCDC:
-    def __init__(self, hv_voltage, p_fixed=15.0, k_sw=0.1, k_cond=0.002, max_power=4000) -> None:
+    def __init__(self, hv_voltage, p_fixed=15.0, k_sw=0.1, k_cond=0.002, max_power=4000, max_power_rate=500.0) -> None:
         """
         Initialize DC/DC converter model with physics-based loss model.
         :param hv_voltage: High-voltage side voltage [V]
@@ -145,12 +176,14 @@ class LVDCDC:
         :param k_sw: Switching loss coefficient [W/A]
         :param k_cond: Conduction loss coefficient [W/A^2]
         :param max_power: Maximum power [W]
+        :param max_power_rate: Maximum power change rate [W/s]
         """
         self.hv_voltage = hv_voltage
         self.p_fixed = p_fixed
         self.k_sw = k_sw
         self.k_cond = k_cond
         self.max_power = max_power
+        self.max_power_rate = max_power_rate
 
     def calculate_losses(self, current) -> float:
         """
@@ -158,6 +191,18 @@ class LVDCDC:
         P_loss = P_fixed + k_sw * |I| + k_cond * I^2
         """
         return self.p_fixed + self.k_sw * abs(current) + self.k_cond * current**2
+
+    def limit_power(self, target_power, current_power, dt) -> float:
+        """
+        Calculate the next power output limited by max_power_rate.
+        """
+        delta_p = target_power - current_power
+        max_delta = self.max_power_rate * dt
+        
+        if abs(delta_p) <= max_delta:
+            return target_power
+        else:
+            return current_power + np.sign(delta_p) * max_delta
 
     def compute(self, lv_voltage, current=None, power=None) -> dict:
         """
@@ -288,29 +333,37 @@ def strategy_ECMS():
     # 4. do same plotting
     pass
 
-def strategy_dumb(battery, converter, time_vec, load_dem_vec, load_dem_vec_smoothed):
-    # STRATEGY 1 (dumb)
+def strategy_dumb(battery, converter, time_vec, load_dem_vec):
+    # STRATEGY 1 (dumb with rate limiting)
     # 1. get current load demand
-    # 2. calculate smoothed load demand and residual
-    # 3. determine Battery voltag and losses with residual
-    # 4. determine DCDC values with smoothed value and battery voltage
-    # 5. plot(losses, voltage, currents) over time
+    # 2. determine DCDC power with rate limiting
+    # 3. determine Battery power as residual
+    # 4. plot(losses, voltage, currents) over time
     batt_result_dict, conv_result_dict = init_results_dicts()
 
     N = len(time_vec)
     dt = time_vec[1] - time_vec[0]
-    load_residual = load_dem_vec - load_dem_vec_smoothed
+    
+    current_dcdc_power = 0.0
 
     # perform simulation
     for ind in range(N):
+        target_power = load_dem_vec[ind]
+        
+        # Limit DCDC power rate
+        current_dcdc_power = converter.limit_power(target_power, current_dcdc_power, dt)
+        
+        # Battery covers the rest
+        batt_power = target_power - current_dcdc_power
+
         # battery results
-        curr_batt_dict = battery.update_charge(power = load_residual[ind], dt=dt)
+        curr_batt_dict = battery.update_charge(power = batt_power, dt=dt)
         # update battey values of current timestep
         for key, val in curr_batt_dict.items():
             batt_result_dict[key].append(val)
 
         # converter
-        curr_conv_dict = converter.compute(lv_voltage = curr_batt_dict["voltage"], power = load_dem_vec_smoothed[ind])
+        curr_conv_dict = converter.compute(lv_voltage = curr_batt_dict["voltage"], power = current_dcdc_power)
         # update converter values of current timestamp
         for key, val in curr_conv_dict.items():
             conv_result_dict[key].append(val)
@@ -318,13 +371,13 @@ def strategy_dumb(battery, converter, time_vec, load_dem_vec, load_dem_vec_smoot
     results = {
         "time" : time_vec,
         "load_dem" : load_dem_vec,
-        "load_smoothed" : load_dem_vec_smoothed,
+        "load_smoothed" : conv_result_dict["p_out"], # Use actual DCDC power for plotting comparison
         "batt_result_dict" : batt_result_dict,
         "conv_result_dict" : conv_result_dict
     }
-    fig1 = plot_results(results, 'Dumb Strategy')
+    fig1 = plot_results(results, 'Dumb Strategy (Rate Limited)')
     fig2 = converter.plot_efficiency_curve(p_vec=conv_result_dict["p_out"], eta_vec=conv_result_dict["efficiency"])
-    fig3 = battery.plot_efficiency_map()
+    fig3 = battery.plot_efficiency_map(power_vec_operation=batt_result_dict["power"], soc_vec_operation=batt_result_dict["soc"])
 
 
 def init_results_dicts():
@@ -349,24 +402,16 @@ def init_results_dicts():
 if __name__ == "__main__":
     # create components
     battery = BattModel(U_min=10.5, U_max=12.6, R_int=0.005, capacity_Ah=70, start_soc=80)
-    converter = LVDCDC(hv_voltage=400, p_fixed=15.0, k_sw=0.1, k_cond=0.002, max_power=4000)
+    converter = LVDCDC(hv_voltage=400, p_fixed=15.0, k_sw=0.1, k_cond=0.002, max_power=4000, max_power_rate=500.0)
     
-    # Verification: Print efficiency at a few points
-    print("--- Verification: Converter Efficiency ---")
-    for p_load in [400, 2000, 4000]:
-        res = converter.compute(lv_voltage=12.0, power=p_load)
-        print(f"Power: {p_load}W, Efficiency: {res['efficiency']*100:.2f}%, Losses: {res['losses']:.2f}W")
-    print("----------------------------------------")
     # fetch scneario
-    time_vec, load_dem_vec, load_dem_vec_smoothed = get_load_scenario(1)
-    load_residual = load_dem_vec - load_dem_vec_smoothed
+    time_vec, load_dem_vec, _ = get_load_scenario(1)
 
     strategy_dumb(
         battery = battery,
         converter = converter,
         time_vec = time_vec,
-        load_dem_vec = load_dem_vec,
-        load_dem_vec_smoothed = load_dem_vec_smoothed
+        load_dem_vec = load_dem_vec
         )
 
     plt.show()
