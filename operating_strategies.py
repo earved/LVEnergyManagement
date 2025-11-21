@@ -137,24 +137,27 @@ class BattModel:
 
 
 class LVDCDC:
-    def __init__(self, hv_voltage, eta_max=0.95, p_opt=500, curve_factor=1e-6, max_power = 4000) -> None:
+    def __init__(self, hv_voltage, p_fixed=15.0, k_sw=0.1, k_cond=0.002, max_power=4000) -> None:
         """
-        Initialize DC/DC converter model.
+        Initialize DC/DC converter model with physics-based loss model.
         :param hv_voltage: High-voltage side voltage [V]
-        :param eta_max: Maximum efficiency (at optimal load)
-        :param p_opt: Optimal load power [W] where efficiency peaks
-        :param curve_factor: Factor for parabolic efficiency drop
+        :param p_fixed: Constant losses [W]
+        :param k_sw: Switching loss coefficient [W/A]
+        :param k_cond: Conduction loss coefficient [W/A^2]
+        :param max_power: Maximum power [W]
         """
         self.hv_voltage = hv_voltage
-        self.eta_max = eta_max
-        self.p_opt = p_opt
-        self.curve_factor = curve_factor
+        self.p_fixed = p_fixed
+        self.k_sw = k_sw
+        self.k_cond = k_cond
         self.max_power = max_power
 
-    def _efficiency(self, p_out) -> float:
-        """Calculate efficiency based on output power using parabolic approximation."""
-        eta = self.eta_max - self.curve_factor * (p_out - self.p_opt) ** 2
-        return max(min(eta, self.eta_max), 0.0)  # Clamp between 0 and eta_max
+    def calculate_losses(self, current) -> float:
+        """
+        Calculate total losses based on current.
+        P_loss = P_fixed + k_sw * |I| + k_cond * I^2
+        """
+        return self.p_fixed + self.k_sw * abs(current) + self.k_cond * current**2
 
     def compute(self, lv_voltage, current=None, power=None) -> dict:
         """
@@ -165,16 +168,18 @@ class LVDCDC:
         :return: dict with efficiency, input power, input current, losses
         """
         if current is not None:
+            i_out = current
             p_out = lv_voltage * current
         elif power is not None:
             p_out = power
+            i_out = p_out / lv_voltage if lv_voltage > 0 else 0
         else:
             raise ValueError("Provide either current or power.")
 
-        eta = self._efficiency(p_out)
-        p_in = p_out / eta if eta > 0 else float('inf')
+        losses = self.calculate_losses(i_out)
+        p_in = p_out + losses
+        eta = p_out / p_in if p_in > 0 else 0.0
         i_in = p_in / self.hv_voltage if self.hv_voltage > 0 else float('inf')
-        losses = p_in - p_out
 
         return {
             "lv_voltage": lv_voltage,
@@ -185,15 +190,27 @@ class LVDCDC:
             "losses": losses
         }
 
-    def plot_efficiency_curve(self, operating_points):
-        """Plot efficiency vs load power."""
-        p_values = np.linspace(0, self.max_power, 100)
-        eta_values = [self._efficiency(p) * 100 for p in p_values]
-        eta_values_operation =[self._efficiency(p) * 100 for p in operating_points]
+    def plot_efficiency_curve(self, p_vec, eta_vec, voltage=12.0):
+        """
+        Plot efficiency vs load power using actual simulation results.
+        Also plots a reference curve at fixed voltage.
+        """
+        # Convert efficiency to percentage
+        eta_percent = [e * 100 for e in eta_vec]
+
+        # Calculate reference curve
+        p_ref = np.linspace(0, self.max_power, 100)
+        eta_ref = []
+        for p in p_ref:
+            i = p / voltage if voltage > 0 else 0
+            loss = self.calculate_losses(i)
+            p_in = p + loss
+            eta = p / p_in if p_in > 0 else 0
+            eta_ref.append(eta * 100)
 
         fig = plt.figure(figsize=(10, 6))
-        plt.plot(p_values, eta_values, label="Efficiency Curve", linewidth=2)
-        plt.scatter(operating_points, eta_values_operation, color='red', alpha=0.5, label="Operating Points", s=10)
+        plt.plot(p_ref, eta_ref, label=f"Reference Curve (@{voltage}V)", linewidth=2, linestyle='--')
+        plt.scatter(p_vec, eta_percent, color='red', alpha=0.5, label="Operating Points", s=10)
         plt.title("DC/DC Converter Efficiency vs. Load Power")
         plt.xlabel("Load Power [W]")
         plt.ylabel("Efficiency [%]")
@@ -306,7 +323,7 @@ def strategy_dumb(battery, converter, time_vec, load_dem_vec, load_dem_vec_smoot
         "conv_result_dict" : conv_result_dict
     }
     fig1 = plot_results(results, 'Dumb Strategy')
-    fig2 = converter.plot_efficiency_curve(operating_points = conv_result_dict["p_out"])
+    fig2 = converter.plot_efficiency_curve(p_vec=conv_result_dict["p_out"], eta_vec=conv_result_dict["efficiency"])
     fig3 = battery.plot_efficiency_map()
 
 
@@ -332,7 +349,14 @@ def init_results_dicts():
 if __name__ == "__main__":
     # create components
     battery = BattModel(U_min=10.5, U_max=12.6, R_int=0.005, capacity_Ah=70, start_soc=80)
-    converter = LVDCDC(hv_voltage=400, eta_max=0.95, p_opt=2000, curve_factor=0.1e-6, max_power=4000)
+    converter = LVDCDC(hv_voltage=400, p_fixed=15.0, k_sw=0.1, k_cond=0.002, max_power=4000)
+    
+    # Verification: Print efficiency at a few points
+    print("--- Verification: Converter Efficiency ---")
+    for p_load in [400, 2000, 4000]:
+        res = converter.compute(lv_voltage=12.0, power=p_load)
+        print(f"Power: {p_load}W, Efficiency: {res['efficiency']*100:.2f}%, Losses: {res['losses']:.2f}W")
+    print("----------------------------------------")
     # fetch scneario
     time_vec, load_dem_vec, load_dem_vec_smoothed = get_load_scenario(1)
     load_residual = load_dem_vec - load_dem_vec_smoothed
