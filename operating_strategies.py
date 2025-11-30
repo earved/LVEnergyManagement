@@ -22,6 +22,7 @@ class BattModel:
         self.U_max = U_max
         self.R_int = R_int
         self.capacity_C = capacity_Ah * 3600  # Convert Ah to coulombs.
+        self.start_soc = start_soc
         self.charge_remaining = self.capacity_C * start_soc/100
 
     def get_soc(self) -> float:
@@ -323,8 +324,11 @@ class LVDCDC:
         Returns:
             matplotlib.figure.Figure: Figure handle for the plot.
         """
+        p_vec = np.asarray(list(p_vec)) if p_vec is not None else np.array([])
+        eta_vec = np.asarray(list(eta_vec)) if eta_vec is not None else np.array([])
+
         # Convert efficiency to percentage.
-        eta_percent = [e * 100 for e in eta_vec]
+        eta_percent = eta_vec * 100 if eta_vec.size > 0 else np.array([])
 
         # Calculate reference curve.
         p_ref = np.linspace(0, self.max_power, 100)
@@ -336,15 +340,51 @@ class LVDCDC:
             eta = p / p_in if p_in > 0 else 0
             eta_ref.append(eta * 100)
 
-        fig = plt.figure(figsize=(10, 6))
-        plt.plot(p_ref, eta_ref, label=f"Reference Curve (@{voltage}V)", linewidth=2, linestyle='--')
-        plt.scatter(p_vec, eta_percent, color='red', alpha=0.5, label="Operating Points", s=10)
-        plt.title("DC/DC Converter Efficiency vs. Load Power")
-        plt.xlabel("Load Power [W]")
-        plt.ylabel("Efficiency [%]")
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.legend()
-        plt.tight_layout()
+        fig, ax_eff = plt.subplots(figsize=(10, 6))
+        ax_eff.plot(p_ref, eta_ref, label=f"Reference Curve (@{voltage}V)", linewidth=2, linestyle='--')
+        if p_vec.size > 0 and eta_percent.size > 0:
+            ax_eff.scatter(p_vec, eta_percent, color='red', alpha=0.5, label="Operating Points", s=10)
+
+        ax_eff.set_title("DC/DC Converter Efficiency vs. Load Power")
+        ax_eff.set_xlabel("Load Power [W]")
+        ax_eff.set_ylabel("Efficiency [%]")
+        ax_eff.grid(True, linestyle='--', alpha=0.7)
+
+        hist_handles = []
+        if p_vec.size > 0:
+            hist_min = min(0.0, float(np.min(p_vec)))
+            hist_max = max(self.max_power, float(np.max(p_vec)))
+            if hist_max - hist_min < 1e-6:
+                hist_max = hist_min + 1.0
+            bins = np.linspace(hist_min, hist_max, 40)
+            hist_counts, bin_edges = np.histogram(p_vec, bins=bins)
+            total_samples = hist_counts.sum()
+            if total_samples > 0:
+                hist_percent = hist_counts / total_samples * 100.0
+                bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+                bar_widths = np.diff(bin_edges)
+                ax_hist = ax_eff.twinx()
+                bars = ax_hist.bar(
+                    bin_centers,
+                    hist_percent,
+                    width=bar_widths,
+                    color='tab:blue',
+                    alpha=0.3,
+                    label="Operating Time Share",
+                    align='center'
+                )
+                ax_hist.set_ylabel("Time Share [%]")
+                ax_hist.set_ylim(0, max(hist_percent) * 1.2)
+                hist_handles.append(bars)
+
+        handles_eff, labels_eff = ax_eff.get_legend_handles_labels()
+        handles_hist, labels_hist = (hist_handles, [h.get_label() for h in hist_handles]) if hist_handles else ([], [])
+        if handles_hist:
+            ax_eff.legend(handles_eff + handles_hist, labels_eff + labels_hist, loc='best')
+        else:
+            ax_eff.legend(loc='best')
+
+        fig.tight_layout()
         return fig
 
 def plot_results(results, plotstring):
@@ -441,7 +481,7 @@ def compute_converter_efficiency_info(converter, lv_voltage_estimate=12.0, sampl
         samples (int): Number of sample points across the power range.
 
     Returns:
-        dict: Sample arrays and derived metrics (peak power, minimum efficient power, peak eta).
+        dict: Sample arrays and derived metrics (peak efficiency power, minimum efficient power (90%), peak eta).
     """
     lv_voltage = max(lv_voltage_estimate, 1.0)
     p_samples = np.linspace(0, converter.max_power, samples)
@@ -482,7 +522,46 @@ def compute_converter_efficiency_info(converter, lv_voltage_estimate=12.0, sampl
     }
        
 def strategy_ECMS(battery, converter, time_vec, load_dem_vec):
-    """Run an equivalent consumption minimization strategy (ECMS).
+    """
+    This function implements an ECMS controller that optimizes power split between
+    a battery and DC/DC converter to minimize equivalent fuel consumption while
+    maintaining charge-sustaining operation (returning to initial SOC).
+    The algorithm uses bisection search to find the optimal equivalence factor (s_opt)
+    that balances battery usage with converter efficiency over the entire driving cycle.
+        dict | None: Results dictionary with the following keys if convergence succeeds:
+            - time (np.ndarray): Time vector
+            - load_dem (np.ndarray): Original load demand
+            - load_smoothed (list): Converter output power
+            - batt_result_dict (dict): Battery telemetry (voltage, current, soc, power, etc.)
+            - conv_result_dict (dict): Converter telemetry (efficiency, losses, etc.)
+            Returns None if optimization fails.
+    Variables:
+        target_soc (float): Target state of charge to return to (initial SOC), in %.
+        s_min (float): Lower bound for equivalence factor in bisection search.
+        s_max (float): Upper bound for equivalence factor in bisection search.
+        s_opt (float): Current equivalence factor candidate value.
+        tolerance (float): SOC convergence tolerance in %.
+        max_iter (int): Maximum number of bisection iterations allowed.
+        num_candidates (int): Number of power setpoints evaluated per timestep.
+        voltage_epsilon (float): Minimum voltage threshold to prevent division by zero.
+        soc_gain (float): Proportional gain for dynamic lambda adjustment based on SOC error.
+        lambda_cap (float): Maximum absolute value for lambda to prevent extreme behavior.
+        battery_loss_weight (float): Weight for battery resistive losses in cost function.
+        low_power_penalty_weight (float): Penalty weight to discourage inefficient low-power operation.
+        peak_penalty_weight (float): Penalty weight to encourage operation near peak efficiency point.
+        conv_eff_info (dict): Converter efficiency characteristics from analysis.
+        p_min_eff (float): Minimum power for 90% of peak converter efficiency.
+        preferred_power (float): Power setpoint at peak converter efficiency.
+        p_active_floor (float): Lower bound for active power candidates.
+        active_candidates (np.ndarray): Power candidate values above minimum efficiency threshold.
+        p_dcdc_candidates_template (np.ndarray): Template array of converter power candidates including zero.
+        best_results (tuple | None): Best simulation results meeting SOC tolerance.
+        best_soc_diff (float): Smallest SOC deviation achieved (currently unused).
+    Notes:
+        - The cost function includes battery losses, converter losses, equivalence cost,
+          and penalties for inefficient operating regions.
+        - Bisection search adjusts s_opt to achieve charge-sustaining operation.
+        - Each iteration runs a full simulation with a fresh battery state.
 
     Args:
         battery (BattModel): Battery model instance used for energy balancing.
@@ -497,13 +576,15 @@ def strategy_ECMS(battery, converter, time_vec, load_dem_vec):
     target_soc = battery.get_soc()  # Target is to return to start SOC.
     s_min = 0.0
     s_max = 2.0
-    s_opt = 0.5
+    s_opt = 1.0
+    s_min_diff = None
+    s_max_diff = None
     tolerance = 0.1 # SOC tolerance in %
     max_iter = 15
-    num_candidates = 200
-    voltage_epsilon = 1e-3
+    num_candidates = 200 # Number of power candidates to evaluate.
+    voltage_epsilon = 1e-3 # Minimum voltage to avoid division by zero.
     soc_gain = 1.5
-    lambda_cap = 3.0
+    lambda_cap = 3.0 # Max lambda value to avoid extreme behavior.
     battery_loss_weight = 1.0
     low_power_penalty_weight = converter.p_fixed * 5.0
     peak_penalty_weight = converter.p_fixed * 3.0
@@ -513,13 +594,10 @@ def strategy_ECMS(battery, converter, time_vec, load_dem_vec):
         lv_voltage_estimate=battery.get_voltage(current=0) or 12.0,
         samples=400
     )
-    p_min_eff = conv_eff_info["p_min_eff"]
+    p_min_eff = conv_eff_info["p_min_eff"] # lower power threshold for 90% efficiency (90% of peak efficiency)
     preferred_power = conv_eff_info["p_peak"] if conv_eff_info["p_peak"] > 0 else converter.max_power * 0.6
     p_active_floor = min(max(preferred_power * 0.9, p_min_eff), converter.max_power)
     preferred_power = min(preferred_power, converter.max_power)
-
-    if num_candidates < 2:
-        num_candidates = 2
 
     if converter.max_power > 0:
         active_candidates = np.linspace(p_active_floor, converter.max_power, max(num_candidates - 1, 1))
@@ -587,6 +665,7 @@ def strategy_ECMS(battery, converter, time_vec, load_dem_vec):
                 peak_penalty_weight * ((p_dcdc_candidates - preferred_power) / max(preferred_power, 1.0))**2,
                 0.0
             )
+            """
             total_cost = (
                 battery_loss_cost
                 + p_loss_conv
@@ -594,6 +673,9 @@ def strategy_ECMS(battery, converter, time_vec, load_dem_vec):
                 + converter_low_power_penalty
                 + converter_peak_penalty
             )
+            """
+            total_cost = lambda_dynamic * (p_loss_batt + p_batt_candidates) + (p_loss_conv + p_dcdc_candidates)
+
             total_cost = np.where(valid_mask, total_cost, np.inf)
 
             if np.all(~np.isfinite(total_cost)):
@@ -625,14 +707,24 @@ def strategy_ECMS(battery, converter, time_vec, load_dem_vec):
             best_results = (batt_result_dict, conv_result_dict)
             break
         
-        # Update s based on whether the battery finished above or below target SOC.
-        
+        # Update s bounds and use linear interpolation on SOC difference to find next candidate.
         if soc_diff > 0:  # SOC too high, encourage battery discharge -> reduce s
             s_max = s_opt
+            s_max_diff = soc_diff
         else:  # SOC too low, encourage charging -> increase s
             s_min = s_opt
+            s_min_diff = soc_diff
 
-        s_opt = (s_min + s_max) / 2
+        if s_min_diff is not None and s_max_diff is not None:
+            denom = s_max_diff - s_min_diff
+            if abs(denom) > 1e-9:
+                s_candidate = s_min - s_min_diff * (s_max - s_min) / denom
+            else:
+                s_candidate = (s_min + s_max) / 2
+        else:
+            s_candidate = (s_min + s_max) / 2
+
+        s_opt = float(np.clip(s_candidate, min(s_min, s_max), max(s_min, s_max)))
         
         if i == max_iter - 1:
             print("Max iterations reached.")
@@ -656,7 +748,7 @@ def strategy_ECMS(battery, converter, time_vec, load_dem_vec):
 
     return None
 
-def strategy_dumb(battery, converter, time_vec, load_dem_vec):
+def strategy_base(battery, converter, time_vec, load_dem_vec):
     """Baseline strategy that rate-limits the converter and lets the battery fill gaps.
 
     Args:
@@ -677,13 +769,19 @@ def strategy_dumb(battery, converter, time_vec, load_dem_vec):
 
     # Perform simulation.
     for ind in range(N):
-        target_power = load_dem_vec[ind]
+        load_power = load_dem_vec[ind]
+        target_power = load_power
+
+        # Slightly increase target_power if SOC drops below start value and decrease if above via linear dependency.
+        soc_deviation = battery.get_soc() - battery.start_soc
+        adjustment_factor = 1 - 0.1 * soc_deviation
+        target_power *= adjustment_factor
         
         # Limit DC/DC power rate.
         current_dcdc_power = converter.limit_power(target_power, current_dcdc_power, dt)
         
-        # Battery covers the remainder.
-        batt_power = target_power - current_dcdc_power
+        # Battery covers the remainder relative to actual load.
+        batt_power = load_power - current_dcdc_power
 
         # Battery results.
         curr_batt_dict = battery.update_charge(power = batt_power, dt=dt)
@@ -704,12 +802,11 @@ def strategy_dumb(battery, converter, time_vec, load_dem_vec):
         "batt_result_dict" : batt_result_dict,
         "conv_result_dict" : conv_result_dict
     }
-    fig1 = plot_results(results, 'Dumb Strategy (Rate Limited)')
+    fig1 = plot_results(results, 'Base Strategy')
     fig2 = converter.plot_efficiency_curve(p_vec=conv_result_dict["p_out"], eta_vec=conv_result_dict["efficiency"])
     fig3 = battery.plot_efficiency_map(power_vec_operation=batt_result_dict["power"], soc_vec_operation=batt_result_dict["soc"])
 
     return results
-
 
 def init_results_dicts():
     """Create empty telemetry containers for battery and converter results.
@@ -735,26 +832,90 @@ def init_results_dicts():
     }
     return batt_result_dict, conv_result_dict
 
-if __name__ == "__main__":
+
+def compute_energy_metrics(results):
+    """Calculate aggregate energy demand and losses for a strategy run.
+
+    Args:
+        results (dict): Strategy results dictionary.
+
+    Returns:
+        dict: Load energy and loss figures in watt-hours.
+    """
+    time = results["time"]
+    if len(time) < 2:
+        return {
+            "load_energy_wh": 0.0,
+            "battery_losses_wh": 0.0,
+            "converter_losses_wh": 0.0,
+            "total_losses_wh": 0.0,
+        }
+
+    dt = float(np.mean(np.diff(time)))
+    load_power = results["load_dem"]
+    batt_losses = np.array(results["batt_result_dict"]["losses"])
+    conv_losses = np.array(results["conv_result_dict"]["losses"])
+
+    load_energy_wh = np.sum(load_power) * dt / 3600.0
+    battery_losses_wh = np.sum(batt_losses) * dt / 3600.0
+    converter_losses_wh = np.sum(conv_losses) * dt / 3600.0
+
+    return {
+        "load_energy_wh": load_energy_wh,
+        "battery_losses_wh": battery_losses_wh,
+        "converter_losses_wh": converter_losses_wh,
+        "total_losses_wh": battery_losses_wh + converter_losses_wh,
+    }
+
+def main():
     # Create components.
     battery = BattModel(U_min=10.5, U_max=12.6, R_int=0.005, capacity_Ah=70, start_soc=80)
-    converter = LVDCDC(hv_voltage=400, p_fixed=25.0, k_sw=0.1, k_cond=0.005, max_power=4000, max_power_rate=500.0)
+    converter = LVDCDC(hv_voltage=400, p_fixed=25.0, k_sw=0.1, k_cond=0.003, max_power=4000, max_power_rate=500.0)
     
     # Fetch scenario.
     time_vec, load_dem_vec, _ = get_load_scenario(1)
 
-    strategy_dumb(
+    base_results = strategy_base(
         battery = copy.deepcopy(battery),
         converter = copy.deepcopy(converter),
         time_vec = time_vec,
         load_dem_vec = load_dem_vec
         )
-    if 1:
-        strategy_ECMS(
-            battery = copy.deepcopy(battery),
-            converter = copy.deepcopy(converter),
-            time_vec = time_vec,
-            load_dem_vec = load_dem_vec
+    ecms_results = strategy_ECMS(
+        battery = copy.deepcopy(battery),
+        converter = copy.deepcopy(converter),
+        time_vec = time_vec,
+        load_dem_vec = load_dem_vec
+        )
+
+    if base_results and ecms_results:
+        base_metrics = compute_energy_metrics(base_results)
+        ecms_metrics = compute_energy_metrics(ecms_results)
+
+        print("\n=== Strategy Energy Summary ===")
+        print(
+            "Base strategy: Load energy = {:.2f} Wh, Total losses = {:.2f} Wh".format(
+                base_metrics["load_energy_wh"], base_metrics["total_losses_wh"]
             )
+        )
+        print(
+            "ECMS strategy: Load energy = {:.2f} Wh, Total losses = {:.2f} Wh".format(
+                ecms_metrics["load_energy_wh"], ecms_metrics["total_losses_wh"]
+            )
+        )
+
+        loss_savings = base_metrics["total_losses_wh"] - ecms_metrics["total_losses_wh"]
+        print("ECMS total-loss savings vs. base: {:.2f} Wh".format(loss_savings))
+
+        # percentage savings
+        if base_metrics["total_losses_wh"] > 0:
+            percent_savings = (loss_savings / base_metrics["total_losses_wh"]) * 100.0
+            print("ECMS percentage savings vs. base: {:.2f} %".format(percent_savings))
 
     plt.show()
+
+    return base_results, ecms_results
+
+if __name__ == "__main__":
+    main()
+
