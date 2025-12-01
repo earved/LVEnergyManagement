@@ -168,12 +168,13 @@ class BattModel:
         p_loss_values = [i**2*self.R_int for i in i_values]
         return p_loss_values
        
-    def plot_efficiency_map(self, power_vec_operation=None, soc_vec_operation=None):
+    def plot_efficiency_map(self, power_vec_operation=None, soc_vec_operation=None, power_limits=None):
         """Plot the battery efficiency map with optional operating points.
 
         Args:
             power_vec_operation (Iterable[float] | None): Historical power samples.
             soc_vec_operation (Iterable[float] | None): Corresponding SOC samples.
+            power_limits (tuple[float, float] | None): Optional fixed min/max power axis limits.
 
         Returns:
             matplotlib.figure.Figure: Figure handle for the contour plot.
@@ -181,7 +182,9 @@ class BattModel:
         soc_range = range(101)
         
         # Determine power range.
-        if power_vec_operation is not None and len(power_vec_operation) > 0:
+        if power_limits is not None:
+            min_p, max_p = power_limits
+        elif power_vec_operation is not None and len(power_vec_operation) > 0:
             min_p_op = min(power_vec_operation)
             max_p_op = max(power_vec_operation)
             margin = (max_p_op - min_p_op) * 0.1 if max_p_op != min_p_op else 100
@@ -222,6 +225,7 @@ class BattModel:
         ax.set_title("Battery Efficiency Map")
         ax.set_xlabel("Power [W] (Negative = Charging)")
         ax.set_ylabel("SOC [%]")
+        ax.set_xlim(min_p, max_p)
         return fig
 
 
@@ -313,13 +317,15 @@ class LVDCDC:
             "losses": losses
         }
 
-    def plot_efficiency_curve(self, p_vec, eta_vec, voltage=12.0):
+    def plot_efficiency_curve(self, p_vec, eta_vec, voltage=12.0, limits=None):
         """Plot simulated efficiency points against a reference curve.
 
         Args:
             p_vec (Iterable[float]): Power samples in watts.
             eta_vec (Iterable[float]): Efficiency samples (0-1).
             voltage (float): Reference LV voltage for the analytic curve.
+            limits (dict | None): Optional axis limit overrides with keys
+                "power", "efficiency", and "hist" (tuples of (min, max)).
 
         Returns:
             matplotlib.figure.Figure: Figure handle for the plot.
@@ -374,8 +380,17 @@ class LVDCDC:
                     align='center'
                 )
                 ax_hist.set_ylabel("Time Share [%]")
-                ax_hist.set_ylim(0, max(hist_percent) * 1.2)
+                if limits and "hist" in limits:
+                    ax_hist.set_ylim(*limits["hist"])
+                else:
+                    ax_hist.set_ylim(0, max(hist_percent) * 1.2 if hist_percent.size > 0 else 1.0)
                 hist_handles.append(bars)
+
+        if limits:
+            if "power" in limits:
+                ax_eff.set_xlim(*limits["power"])
+            if "efficiency" in limits:
+                ax_eff.set_ylim(*limits["efficiency"])
 
         handles_eff, labels_eff = ax_eff.get_legend_handles_labels()
         handles_hist, labels_hist = (hist_handles, [h.get_label() for h in hist_handles]) if hist_handles else ([], [])
@@ -387,12 +402,14 @@ class LVDCDC:
         fig.tight_layout()
         return fig
 
-def plot_results(results, plotstring):
+def plot_results(results, plotstring, axis_limits=None):
     """Render standard plots for converter and battery telemetry.
 
     Args:
         results (dict): Dictionary containing time, load, battery, and converter traces.
         plotstring (str): Title prefix used for the plot window.
+        axis_limits (dict | None): Optional axis limits with keys
+            "time", "power", "soc", "losses", "voltage", "energy".
 
     Returns:
         matplotlib.figure.Figure: Figure handle for the combined plot.
@@ -411,22 +428,30 @@ def plot_results(results, plotstring):
     axs[0].set_ylabel("Power [W]")
     axs[0].legend(loc='upper right')
     axs[0].grid(True, linestyle='--', alpha=0.5)
+    if axis_limits and "power" in axis_limits:
+        axs[0].set_ylim(*axis_limits["power"])
 
     axs[1].plot(results["time"], batt_result_dict["soc"], label="Battery SOC", color='green')
     axs[1].set_ylabel("SOC [%]")
     axs[1].legend(loc='upper right')
     axs[1].grid(True, linestyle='--', alpha=0.5)
+    if axis_limits and "soc" in axis_limits:
+        axs[1].set_ylim(*axis_limits["soc"])
 
     axs[2].plot(results["time"], batt_result_dict["losses"], label="Battery Losses")
     axs[2].plot(results["time"], conv_result_dict["losses"], label="DC/DC Losses")
     axs[2].set_ylabel("Power Loss [W]")
     axs[2].legend(loc='upper right')
     axs[2].grid(True, linestyle='--', alpha=0.5)
+    if axis_limits and "losses" in axis_limits:
+        axs[2].set_ylim(*axis_limits["losses"])
 
     axs[3].plot(results["time"], batt_result_dict["voltage"], label="Battery Voltage", color='orange')
     axs[3].set_ylabel("Voltage [V]")
     axs[3].legend(loc='upper right')
     axs[3].grid(True, linestyle='--', alpha=0.5)
+    if axis_limits and "voltage" in axis_limits:
+        axs[3].set_ylim(*axis_limits["voltage"])
 
     # Calculate cumulative energy losses in watt-hours.
     time = results["time"]
@@ -442,6 +467,12 @@ def plot_results(results, plotstring):
     axs[4].set_xlabel("Time [s]")
     axs[4].legend(loc='upper right')
     axs[4].grid(True, linestyle='--', alpha=0.5)
+    if axis_limits and "energy" in axis_limits:
+        axs[4].set_ylim(*axis_limits["energy"])
+
+    if axis_limits and "time" in axis_limits:
+        for ax in axs:
+            ax.set_xlim(*axis_limits["time"])
 
     plt.tight_layout()
     return fig
@@ -521,7 +552,7 @@ def compute_converter_efficiency_info(converter, lv_voltage_estimate=12.0, sampl
         "eta_peak": eta_peak
     }
        
-def strategy_ECMS(battery, converter, time_vec, load_dem_vec):
+def strategy_ECMS(battery, converter, time_vec, load_dem_vec, plot_figures=True):
     """
     This function implements an ECMS controller that optimizes power split between
     a battery and DC/DC converter to minimize equivalent fuel consumption while
@@ -567,7 +598,8 @@ def strategy_ECMS(battery, converter, time_vec, load_dem_vec):
         battery (BattModel): Battery model instance used for energy balancing.
         converter (LVDCDC): Converter supplying the LV bus.
         time_vec (np.ndarray): Simulation time vector in seconds.
-        load_dem_vec (np.ndarray): LV load demand trace in watts.
+    load_dem_vec (np.ndarray): LV load demand trace in watts.
+    plot_figures (bool): Whether to generate plots internally (default True).
 
     Returns:
         dict | None: Results dictionary with telemetry if convergence succeeds, else None.
@@ -740,22 +772,25 @@ def strategy_ECMS(battery, converter, time_vec, load_dem_vec):
             "batt_result_dict" : batt_res,
             "conv_result_dict" : conv_res
         }
-        fig1 = plot_results(results, f'ECMS Strategy (s={s_opt:.4f})')
-        fig2 = converter.plot_efficiency_curve(p_vec=conv_res["p_out"], eta_vec=conv_res["efficiency"])
-        fig3 = battery.plot_efficiency_map(power_vec_operation=batt_res["power"], soc_vec_operation=batt_res["soc"])
+        results["s_opt"] = s_opt
+        if plot_figures:
+            plot_results(results, f'ECMS Strategy (s={s_opt:.4f})')
+            converter.plot_efficiency_curve(p_vec=conv_res["p_out"], eta_vec=conv_res["efficiency"])
+            battery.plot_efficiency_map(power_vec_operation=batt_res["power"], soc_vec_operation=batt_res["soc"])
 
         return results
 
     return None
 
-def strategy_base(battery, converter, time_vec, load_dem_vec):
+def strategy_base(battery, converter, time_vec, load_dem_vec, plot_figures=True):
     """Baseline strategy that rate-limits the converter and lets the battery fill gaps.
 
     Args:
         battery (BattModel): Battery model instance.
         converter (LVDCDC): Converter model instance.
         time_vec (np.ndarray): Simulation time vector in seconds.
-        load_dem_vec (np.ndarray): LV load demand trace in watts.
+    load_dem_vec (np.ndarray): LV load demand trace in watts.
+    plot_figures (bool): Whether to generate plots internally (default True).
 
     Returns:
         dict: Results dictionary with telemetry for plotting.
@@ -802,9 +837,10 @@ def strategy_base(battery, converter, time_vec, load_dem_vec):
         "batt_result_dict" : batt_result_dict,
         "conv_result_dict" : conv_result_dict
     }
-    fig1 = plot_results(results, 'Base Strategy')
-    fig2 = converter.plot_efficiency_curve(p_vec=conv_result_dict["p_out"], eta_vec=conv_result_dict["efficiency"])
-    fig3 = battery.plot_efficiency_map(power_vec_operation=batt_result_dict["power"], soc_vec_operation=batt_result_dict["soc"])
+    if plot_figures:
+        plot_results(results, 'Base Strategy')
+        converter.plot_efficiency_curve(p_vec=conv_result_dict["p_out"], eta_vec=conv_result_dict["efficiency"])
+        battery.plot_efficiency_map(power_vec_operation=batt_result_dict["power"], soc_vec_operation=batt_result_dict["soc"])
 
     return results
 
@@ -867,6 +903,120 @@ def compute_energy_metrics(results):
         "total_losses_wh": battery_losses_wh + converter_losses_wh,
     }
 
+
+def _pad_limits(min_val, max_val, pad_ratio=0.05, min_span=1e-3):
+    if min_val is None or max_val is None:
+        return None
+    span = max(max_val - min_val, min_span)
+    pad = span * pad_ratio
+    return (min_val - pad, max_val + pad)
+
+
+def compute_timeseries_axis_limits(results_list):
+    """Derive shared axis limits for time-series plots across strategies."""
+    time_min = float('inf')
+    time_max = float('-inf')
+    power_vals = []
+    soc_vals = []
+    loss_vals = []
+    voltage_vals = []
+    energy_vals = []
+
+    for res in results_list:
+        if not res:
+            continue
+        time = np.asarray(res.get("time", []))
+        if time.size == 0:
+            continue
+        time_min = min(time_min, float(time[0]))
+        time_max = max(time_max, float(time[-1]))
+
+        load = np.asarray(res.get("load_dem", []))
+        conv_power = np.asarray(res["conv_result_dict"].get("p_out", []))
+        batt_power = np.asarray(res["batt_result_dict"].get("power", []))
+        if load.size:
+            power_vals.extend([float(load.min()), float(load.max())])
+        if conv_power.size:
+            power_vals.extend([float(conv_power.min()), float(conv_power.max())])
+        if batt_power.size:
+            power_vals.extend([float(batt_power.min()), float(batt_power.max())])
+
+        soc = np.asarray(res["batt_result_dict"].get("soc", []))
+        if soc.size:
+            soc_vals.extend([float(soc.min()), float(soc.max())])
+
+        batt_losses = np.asarray(res["batt_result_dict"].get("losses", []))
+        conv_losses = np.asarray(res["conv_result_dict"].get("losses", []))
+        if batt_losses.size:
+            loss_vals.extend([float(batt_losses.min()), float(batt_losses.max())])
+        if conv_losses.size:
+            loss_vals.extend([float(conv_losses.min()), float(conv_losses.max())])
+
+        voltage = np.asarray(res["batt_result_dict"].get("voltage", []))
+        if voltage.size:
+            voltage_vals.extend([float(voltage.min()), float(voltage.max())])
+
+        # Energy traces
+        if time.size >= 2:
+            dt = float(np.mean(np.diff(time)))
+            batt_loss_wh = np.cumsum(batt_losses) * dt / 3600 if batt_losses.size else np.array([])
+            conv_loss_wh = np.cumsum(conv_losses) * dt / 3600 if conv_losses.size else np.array([])
+            total_loss_wh = batt_loss_wh + conv_loss_wh if batt_loss_wh.size and conv_loss_wh.size else np.array([])
+            for arr in (batt_loss_wh, conv_loss_wh, total_loss_wh):
+                if arr.size:
+                    energy_vals.extend([float(arr.min()), float(arr.max())])
+
+    limits = {}
+    if time_min < time_max:
+        limits["time"] = (time_min, time_max)
+    if power_vals:
+        limits["power"] = _pad_limits(min(power_vals), max(power_vals))
+    if soc_vals:
+        limits["soc"] = _pad_limits(min(soc_vals), max(soc_vals))
+    if loss_vals:
+        limits["losses"] = _pad_limits(min(loss_vals), max(loss_vals))
+    if voltage_vals:
+        limits["voltage"] = _pad_limits(min(voltage_vals), max(voltage_vals))
+    if energy_vals:
+        limits["energy"] = _pad_limits(min(energy_vals), max(energy_vals))
+
+    return limits
+
+
+def compute_converter_axis_limits(results_list):
+    """Derive shared axis limits for converter efficiency plots."""
+    power_vals = []
+    for res in results_list:
+        if not res:
+            continue
+        p_out = np.asarray(res["conv_result_dict"].get("p_out", []))
+        if p_out.size:
+            power_vals.extend([float(p_out.min()), float(p_out.max())])
+
+    limits = {
+        "efficiency": (0.0, 100.0),
+        "hist": (0.0, 100.0)
+    }
+    if power_vals:
+        limits["power"] = _pad_limits(min(power_vals + [0.0]), max(power_vals + [0.0]))
+    else:
+        limits["power"] = (0.0, 1.0)
+    return limits
+
+
+def compute_battery_power_limits(results_list):
+    """Return shared power limits for battery efficiency maps."""
+    power_vals = []
+    for res in results_list:
+        if not res:
+            continue
+        batt_power = np.asarray(res["batt_result_dict"].get("power", []))
+        if batt_power.size:
+            power_vals.extend([float(batt_power.min()), float(batt_power.max())])
+    if power_vals:
+        return _pad_limits(min(power_vals), max(power_vals))
+    return None
+
 def main():
     # Create components.
     battery = BattModel(U_min=10.5, U_max=12.6, R_int=0.005, capacity_Ah=70, start_soc=80)
@@ -879,13 +1029,15 @@ def main():
         battery = copy.deepcopy(battery),
         converter = copy.deepcopy(converter),
         time_vec = time_vec,
-        load_dem_vec = load_dem_vec
+        load_dem_vec = load_dem_vec,
+        plot_figures = False
         )
     ecms_results = strategy_ECMS(
         battery = copy.deepcopy(battery),
         converter = copy.deepcopy(converter),
         time_vec = time_vec,
-        load_dem_vec = load_dem_vec
+        load_dem_vec = load_dem_vec,
+        plot_figures = False
         )
 
     if base_results and ecms_results:
@@ -911,6 +1063,36 @@ def main():
         if base_metrics["total_losses_wh"] > 0:
             percent_savings = (loss_savings / base_metrics["total_losses_wh"]) * 100.0
             print("ECMS percentage savings vs. base: {:.2f} %".format(percent_savings))
+
+    # Derive shared axis limits for plotting and render figures for each strategy.
+    results_list = [res for res in (base_results, ecms_results) if res]
+    axis_limits = compute_timeseries_axis_limits(results_list)
+    converter_limits = compute_converter_axis_limits(results_list)
+    battery_power_limits = compute_battery_power_limits(results_list)
+
+    labeled_results = []
+    if base_results:
+        labeled_results.append(("Base Strategy", base_results))
+    if ecms_results:
+        s_val = ecms_results.get("s_opt", None)
+        if s_val is not None:
+            label = f"ECMS Strategy (s={s_val:.4f})"
+        else:
+            label = "ECMS Strategy"
+        labeled_results.append((label, ecms_results))
+
+    for label, res in labeled_results:
+        plot_results(res, label, axis_limits=axis_limits)
+        converter.plot_efficiency_curve(
+            p_vec=res["conv_result_dict"]["p_out"],
+            eta_vec=res["conv_result_dict"]["efficiency"],
+            limits=converter_limits
+        )
+        battery.plot_efficiency_map(
+            power_vec_operation=res["batt_result_dict"]["power"],
+            soc_vec_operation=res["batt_result_dict"]["soc"],
+            power_limits=battery_power_limits
+        )
 
     plt.show()
 
