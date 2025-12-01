@@ -493,7 +493,7 @@ def get_load_scenario(ind=1):
         case 1:
             scenario = pd.read_csv("lv_power_demand.csv")
         case 2:
-            pass
+            scenario = pd.read_csv("lv_power_demand_variant.csv")
         case _:
             raise ValueError("Scenario index not available")
        
@@ -652,6 +652,7 @@ def strategy_ECMS(battery, converter, time_vec, load_dem_vec, plot_figures=True)
         batt_result_dict, conv_result_dict = init_results_dicts()
         N = len(time_vec)
         dt = time_vec[1] - time_vec[0]
+        current_dcdc_power = 0.0
         
         # Simulation loop over all samples.
         for ind in range(N):
@@ -711,16 +712,20 @@ def strategy_ECMS(battery, converter, time_vec, load_dem_vec, plot_figures=True)
             total_cost = np.where(valid_mask, total_cost, np.inf)
 
             if np.all(~np.isfinite(total_cost)):
-                best_p_dcdc = float(np.clip(P_load, 0, converter.max_power))
+                desired_p_dcdc = float(np.clip(P_load, 0, converter.max_power))
             else:
                 best_idx = int(np.argmin(total_cost))
-                best_p_dcdc = float(p_dcdc_candidates[best_idx])
-            
-            p_batt_opt = P_load - best_p_dcdc
+                desired_p_dcdc = float(p_dcdc_candidates[best_idx])
+
+            # Apply converter rate limit to model finite dynamics.
+            limited_p_dcdc = converter.limit_power(desired_p_dcdc, current_dcdc_power, dt)
+            current_dcdc_power = limited_p_dcdc
+
+            p_batt_opt = P_load - limited_p_dcdc
             
             # Apply to components.
             curr_batt_dict = temp_battery.update_charge(power=p_batt_opt, dt=dt)
-            curr_conv_dict = converter.compute(lv_voltage=curr_batt_dict["voltage"], power=best_p_dcdc)
+            curr_conv_dict = converter.compute(lv_voltage=curr_batt_dict["voltage"], power=limited_p_dcdc)
             
             # Store results
             for key, val in curr_batt_dict.items():
